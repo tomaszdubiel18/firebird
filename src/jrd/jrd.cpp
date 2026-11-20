@@ -2246,6 +2246,13 @@ JAttachment* JProvider::internalAttach(CheckStatusWrapper* user_status, const ch
 
 				try
 				{
+					// Start metadata read transaction before loading of any metadata,
+					// see Attachment::getMetaTransaction().
+					// Ensure this transaction can't trigger auto-sweep.
+					attachment->att_flags |= ATT_no_cleanup;
+					attachment->createMetaTransaction(tdbb);
+					attachment->att_flags = save_flags;
+
 					// load all database triggers
 					MET_load_db_triggers(tdbb, DB_TRIGGER_CONNECT);
 					MET_load_db_triggers(tdbb, DB_TRIGGER_DISCONNECT);
@@ -8278,6 +8285,9 @@ static void purge_transactions(thread_db* tdbb, Jrd::Attachment* attachment, con
 		attachment->att_dbkey_trans = NULL;
 		TRA_commit(tdbb, trans_dbk, false);
 	}
+
+	// Metadata read transaction is not in the list of attachment transactions
+	attachment->rollbackMetaTransaction(tdbb);
 }
 
 
@@ -8787,6 +8797,14 @@ static void unwindAttach(thread_db* tdbb, const char* filename, const Exception&
 				RefPtr<StableAttachmentPart> sAtt(attachment->getStable());
 				// Will release addRef() addedin  create_attachment()
 				RefPtr<JAttachment> jAtt(REF_NO_INCR, sAtt->getInterface());
+
+				// Rollback metadata read transaction
+				try
+				{
+					attachment->rollbackMetaTransaction(tdbb);
+				}
+				catch (const Exception&)
+				{} // no-op
 
 				// This unlocking/locking order guarantees stable release of attachment
 				sAtt->manualUnlock(attachment->att_flags);

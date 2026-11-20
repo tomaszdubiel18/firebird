@@ -2456,6 +2456,9 @@ static int limbo_transaction(thread_db* tdbb, TraNumber id)
 
 void jrd_tra::unlinkFromAttachment()
 {
+	if (tra_flags & TRA_meta)
+		return;						// Not linked, see transaction_start()
+
 	for (jrd_tra** ptr = &tra_attachment->att_transactions; *ptr; ptr = &(*ptr)->tra_next)
 	{
 		if (*ptr == this)
@@ -3612,8 +3615,11 @@ static void transaction_start(thread_db* tdbb, jrd_tra* trans)
 
 	// Link the transaction to the attachment block before releasing
 	// header page for handling signals.
+	// Metadata read transaction is not linked: it is not a user transaction
+	// and it is rolled back by Attachment::rollbackMetaTransaction().
 
-	trans->linkToAttachment(attachment);
+	if (!(trans->tra_flags & TRA_meta))
+		trans->linkToAttachment(attachment);
 
 	try
 	{

@@ -104,6 +104,7 @@
 #include "../jrd/idx_proto.h"
 #include "../jrd/intl_proto.h"
 #include "../common/isc_f_proto.h"
+#include "../common/isc_proto.h"
 
 #include "../jrd/lck_proto.h"
 #include "../jrd/met_proto.h"
@@ -507,6 +508,7 @@ static void get_trigger_dependencies(DeferredWork*, bool, jrd_tra*);
 static Format* make_format(thread_db*, jrd_rel*, USHORT *, TemporaryField*, DeferredWork* = nullptr, jrd_tra* = nullptr);
 static void put_summary_blob(thread_db* tdbb, blb*, enum rsr_t, bid*, jrd_tra*);
 static void put_summary_record(thread_db* tdbb, blb*, enum rsr_t, const UCHAR*, ULONG);
+static void signal_relation_rescan(thread_db*, USHORT);
 static void	setup_array(thread_db*, blb*, const TEXT*, USHORT, TemporaryField*);
 static blb*	setup_triggers(thread_db*, jrd_rel*, bool, TrigVector**, blb*);
 static void	setup_trigger_details(thread_db*, jrd_rel*, blb*, TrigVector**, const TEXT*, bool);
@@ -1510,6 +1512,9 @@ void DFW_perform_work(thread_db* tdbb, jrd_tra* transaction)
 
 	Jrd::ContextPoolHolder context(tdbb, transaction->tra_pool);
 
+	// Metadata changes made by the transaction are being applied again
+	transaction->tra_flags &= ~TRA_dfw_failed;
+
 	/* Loop for as long as any of the deferred work routines says that it has
 	more to do.  A deferred work routine should be able to deal with any
 	value of phase, either to say that it wants to be called again in the
@@ -1563,6 +1568,10 @@ void DFW_perform_work(thread_db* tdbb, jrd_tra* transaction)
 			// Do any necessary cleanup
 			if (!phase)
 			{
+				// Cleanup is done. Metadata changes of the transaction were not applied,
+				// its uncommitted metadata must not be used, see Attachment::getMetaTransaction().
+				transaction->tra_flags |= TRA_dfw_failed;
+
 				ex.stuffException(tdbb->tdbb_status_vector);
 				ERR_punt();
 			}
@@ -1577,7 +1586,8 @@ void DFW_perform_work(thread_db* tdbb, jrd_tra* transaction)
 
 	// Remove deferred work blocks so that system transaction and
 	// commit retaining transactions don't re-execute them. Leave
-	// events to be posted after commit
+	// events to be posted after commit, and relations to be rescanned
+	// by other attachments after commit
 
 	for (DeferredWork* itr = transaction->tra_deferred_job->work; itr;)
 	{
@@ -1588,6 +1598,7 @@ void DFW_perform_work(thread_db* tdbb, jrd_tra* transaction)
 		{
 		case dfw_post_event:
 		case dfw_delete_shadow:
+		case dfw_scan_relation:
 			break;
 
 		default:
@@ -1616,6 +1627,7 @@ void DFW_perform_post_commit_work(jrd_tra* transaction)
  *	Perform any post commit work
  *	1. Post any pending events.
  *	2. Unlink shadow files for dropped shadows
+ *	3. Signal other attachments to rescan relations with changed metadata
  *
  *	Then, delete it from chain of pending work.
  *
@@ -1626,6 +1638,7 @@ void DFW_perform_post_commit_work(jrd_tra* transaction)
 
 	bool pending_events = false;
 
+	thread_db* tdbb = JRD_get_thread_data();
 	Database* dbb = GET_DBB();
 
 	for (DeferredWork* itr = transaction->tra_deferred_job->work; itr;)
@@ -1648,6 +1661,10 @@ void DFW_perform_post_commit_work(jrd_tra* transaction)
 		case dfw_delete_shadow:
 			if (work->dfw_name.hasData())
 				unlink(work->dfw_name.c_str());
+			delete work;
+			break;
+		case dfw_scan_relation:
+			signal_relation_rescan(tdbb, work->dfw_id);
 			delete work;
 			break;
 		default:
@@ -5977,6 +5994,26 @@ static bool make_version(thread_db* tdbb, SSHORT phase, DeferredWork* work, jrd_
 			triggers[n] = NULL;
 		}
 
+		{
+			// Serialize format creation between DDL transactions that change the same relation
+			// at the same time. The relation record is updated (nothing is changed) by this
+			// transaction first. A concurrent DDL transaction waits here or gets an update
+			// conflict before it stores a format. Without it both transactions could store
+			// a format with the same number (RDB$FORMAT + 1), and cleanup (phase 0) of the
+			// one that fails to commit would erase the format of the committed one.
+
+			AutoRequest lockRequest;
+
+			FOR(REQUEST_HANDLE lockRequest TRANSACTION_HANDLE transaction)
+				REL IN RDB$RELATIONS WITH REL.RDB$RELATION_NAME EQ work->dfw_name.c_str()
+			{
+				MODIFY REL USING
+					REL.RDB$FORMAT.NULL = REL.RDB$FORMAT.NULL;
+				END_MODIFY
+			}
+			END_FOR
+		}
+
 		AutoCacheRequest request_fmt1(tdbb, irq_format1, IRQ_REQUESTS);
 
 		// User transaction may be safely used instead of system cause
@@ -6387,19 +6424,13 @@ static bool make_version(thread_db* tdbb, SSHORT phase, DeferredWork* work, jrd_
 			make_format(tdbb, relation, 0, external);
 		}
 
+		// Rescan the relation in this attachment (see scan_relation()). Other attachments
+		// can't see the new format before commit, they are signalled to rescan the relation
+		// after commit, see DFW_perform_post_commit_work().
+
 		relation->rel_flags &= ~REL_scanned;
-		DFW_post_work(transaction, dfw_scan_relation, NULL, relation->rel_id);
-
-		// signal others about new format presence
 		LCK_release(tdbb, relation->rel_rescan_lock);
-		{
-			// Use temp lock to avoid AST call
-			Lock tmpLock(tdbb, sizeof(SLONG), LCK_rel_rescan);
-			tmpLock.setKey(relation->rel_id);
-
-			LCK_lock(tdbb, &tmpLock, LCK_EX, LCK_WAIT);
-			LCK_release(tdbb, &tmpLock);
-		}
+		DFW_post_work(transaction, dfw_scan_relation, NULL, relation->rel_id);
 
 		break;
 	}
@@ -6602,6 +6633,55 @@ static void put_summary_record(thread_db* tdbb,
 	memcpy(p, data, length);
 
 	blob->BLB_put_segment(tdbb, buffer.begin(), length + 1);
+}
+
+
+static void signal_relation_rescan(thread_db* tdbb, USHORT rel_id)
+{
+/**************************************
+ *
+ *	s i g n a l _ r e l a t i o n _ r e s c a n
+ *
+ **************************************
+ *
+ * Functional description
+ *	Make all attachments rescan the relation: the transaction that changed
+ *	its metadata is committed. Called after commit, so errors are logged
+ *	instead of being reported to the caller.
+ *
+ **************************************/
+	SET_TDBB(tdbb);
+	Jrd::Attachment* const attachment = tdbb->getAttachment();
+
+	ThreadStatusGuard temp_status(tdbb);
+
+	try
+	{
+		// This attachment holds the rescan lock too. Release it (the relation
+		// is rescanned when used next time) to not wait for ourselves below.
+
+		vec<jrd_rel*>* const relations = attachment->att_relations;
+		jrd_rel* const relation = (relations && rel_id < relations->count()) ? (*relations)[rel_id] : NULL;
+
+		if (relation && relation->rel_rescan_lock)
+		{
+			relation->rel_flags &= ~REL_scanned;
+			LCK_release(tdbb, relation->rel_rescan_lock);
+		}
+
+		// Use temp lock to avoid AST call
+		Lock tmpLock(tdbb, sizeof(SLONG), LCK_rel_rescan);
+		tmpLock.setKey(rel_id);
+
+		if (LCK_lock(tdbb, &tmpLock, LCK_EX, LCK_WAIT))
+			LCK_release(tdbb, &tmpLock);
+		else
+			iscLogStatus("Error signalling relation rescan after commit", temp_status);
+	}
+	catch (const Firebird::Exception& ex)
+	{
+		iscLogException("Error signalling relation rescan after commit", ex);
+	}
 }
 
 

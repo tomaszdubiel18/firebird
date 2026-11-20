@@ -567,6 +567,8 @@ public:
 
 private:
 	jrd_tra*	att_sys_transaction;		// system transaction
+	jrd_tra*	att_meta_transaction;		// metadata read transaction
+	TraNumber	att_meta_number = 0;		// number with which metadata transaction was started
 	StableAttachmentPart* att_stable;
 
 public:
@@ -695,6 +697,9 @@ public:
 	bool locksmith(thread_db* tdbb, SystemPrivilege sp) const;
 	jrd_tra* getSysTransaction();
 	void setSysTransaction(jrd_tra* trans);	// used only by TRA_init
+	jrd_tra* getMetaTransaction(thread_db* tdbb);	// read only read committed, to read metadata
+	void createMetaTransaction(thread_db* tdbb);
+	void rollbackMetaTransaction(thread_db* tdbb);
 
 	bool isSystem() const
 	{

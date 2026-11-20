@@ -950,6 +950,86 @@ void Jrd::Attachment::releaseRelations(thread_db* tdbb)
 	}
 }
 
+void Jrd::Attachment::createMetaTransaction(thread_db* tdbb)
+{
+/**************************************
+ *
+ *	c r e a t e M e t a T r a n s a c t i o n
+ *
+ **************************************
+ *
+ * Functional description
+ *	Start read only read committed transaction used to read metadata
+ *	that must not be seen before commit, see getMetaTransaction().
+ *	The transaction is not linked to the attachment and doesn't keep
+ *	its lock: being read only read committed it is precommitted.
+ *
+ **************************************/
+	if (!att_meta_transaction)
+	{
+		att_meta_transaction = TRA_start(tdbb,
+			TRA_readonly | TRA_ignore_limbo | TRA_read_committed | TRA_rec_version | TRA_meta,
+			DEFAULT_LOCK_TIMEOUT);
+
+		if (att_meta_transaction->tra_lock)
+		{
+			LCK_release(tdbb, att_meta_transaction->tra_lock);
+			att_meta_transaction->tra_lock = nullptr;
+		}
+
+		att_meta_number = att_meta_transaction->tra_number;
+	}
+}
+
+jrd_tra* Jrd::Attachment::getMetaTransaction(thread_db* tdbb)
+{
+/**************************************
+ *
+ *	g e t M e t a T r a n s a c t i o n
+ *
+ **************************************
+ *
+ * Functional description
+ *	Return transaction to read metadata. It sees metadata committed by other
+ *	transactions and uncommitted changes of the current transaction, but not
+ *	uncommitted changes of other transactions (system transaction sees them).
+ *
+ *	After a failed attempt to commit (deferred work failed and was cleaned up)
+ *	own uncommitted changes are not seen: they describe metadata that was
+ *	never applied, e.g. a record format already removed by the cleanup.
+ *
+ **************************************/
+	jrd_tra* const tra = tdbb->getTransaction();
+
+	if (!att_meta_transaction)
+	{
+		if (!tra || tra == getSysTransaction())
+			return getSysTransaction();
+
+		createMetaTransaction(tdbb);
+	}
+
+	att_meta_transaction->tra_number =
+		(tra && tra->tra_number && !(tra->tra_flags & TRA_dfw_failed)) ? tra->tra_number : 1;
+
+	return att_meta_transaction;
+}
+
+void Jrd::Attachment::rollbackMetaTransaction(thread_db* tdbb)
+{
+/**************************************
+ *
+ *	r o l l b a c k M e t a T r a n s a c t i o n
+ *
+ **************************************/
+	if (jrd_tra* const transaction = att_meta_transaction)
+	{
+		att_meta_transaction = nullptr;
+		transaction->tra_number = att_meta_number;
+		TRA_rollback(tdbb, transaction, false, true);
+	}
+}
+
 int Jrd::Attachment::blockingAstShutdown(void* ast_object)
 {
 	Jrd::Attachment* const attachment = static_cast<Jrd::Attachment*>(ast_object);

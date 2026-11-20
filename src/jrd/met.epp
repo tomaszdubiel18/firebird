@@ -1257,9 +1257,12 @@ Format* MET_current(thread_db* tdbb, jrd_rel* relation)
 
 	if (!(relation->rel_flags & REL_scanned))
 	{
+		// See scan_relation() why the metadata read transaction is used
+		jrd_tra* const metaTransaction = attachment->getMetaTransaction(tdbb);
+
 		AutoCacheRequest request(tdbb, irq_l_curr_format, IRQ_REQUESTS);
 
-		FOR(REQUEST_HANDLE request)
+		FOR(REQUEST_HANDLE request TRANSACTION_HANDLE metaTransaction)
 			REL IN RDB$RELATIONS
 			WITH REL.RDB$RELATION_ID EQ relation->rel_id
 		{
@@ -4106,7 +4109,17 @@ static void scan_relation(thread_db* tdbb, jrd_rel* relation)
 
 	bool found = false;
 
-	FOR(REQUEST_HANDLE request)
+	// RDB$RELATIONS is read using the metadata read transaction, not the system one.
+	// The system transaction sees uncommitted changes of other transactions, including
+	// the new format of a relation whose DDL transaction is still committing and may
+	// fail. Records stored with such format by other attachments can't be read after
+	// the failure: the format is removed and its number is used again by the next DDL.
+	// Other attachments are signalled to rescan the relation once the DDL transaction
+	// is committed, see DFW_perform_post_commit_work().
+
+	jrd_tra* const metaTransaction = attachment->getMetaTransaction(tdbb);
+
+	FOR(REQUEST_HANDLE request TRANSACTION_HANDLE metaTransaction)
 		REL IN RDB$RELATIONS WITH REL.RDB$RELATION_ID EQ relation->rel_id
 	{
 		found = true;

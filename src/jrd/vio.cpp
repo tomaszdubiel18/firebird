@@ -5525,6 +5525,7 @@ void Database::garbage_collector(Database* dbb)
 			TRA_commit(tdbb, transaction, false);
 
 		Monitoring::cleanupAttachment(tdbb);
+		attachment->rollbackMetaTransaction(tdbb);
 		attachment->releaseLocks(tdbb);
 		LCK_fini(tdbb, LCK_OWNER_attachment);
 
