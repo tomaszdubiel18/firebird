@@ -504,7 +504,8 @@ static bool formatsAreEqual(const Format*, const Format*);
 static bool	find_depend_in_dfw(thread_db*, TEXT*, USHORT, USHORT, jrd_tra*);
 static void get_array_desc(thread_db*, const TEXT*, Ods::InternalArrayDesc*);
 static void get_trigger_dependencies(DeferredWork*, bool, jrd_tra*);
-static Format* make_format(thread_db*, jrd_rel*, USHORT *, TemporaryField*, DeferredWork* = nullptr, jrd_tra* = nullptr);
+static Format* make_format(thread_db*, jrd_rel*, USHORT *, TemporaryField*, DeferredWork* = nullptr, jrd_tra* = nullptr,
+	USHORT previousVersion = 0);
 static void put_summary_blob(thread_db* tdbb, blb*, enum rsr_t, bid*, jrd_tra*);
 static void put_summary_record(thread_db* tdbb, blb*, enum rsr_t, const UCHAR*, ULONG);
 static void	setup_array(thread_db*, blb*, const TEXT*, USHORT, TemporaryField*);
@@ -5656,7 +5657,7 @@ static void get_trigger_dependencies(DeferredWork* work, bool compile, jrd_tra* 
 
 
 static Format* make_format(thread_db* tdbb, jrd_rel* relation, USHORT* version, TemporaryField* stack,
-	DeferredWork* work, jrd_tra* transaction)
+	DeferredWork* work, jrd_tra* transaction, USHORT previousVersion)
 {
 /**************************************
  *
@@ -5666,6 +5667,11 @@ static Format* make_format(thread_db* tdbb, jrd_rel* relation, USHORT* version, 
  *
  * Functional description
  *	Make a format block for a relation.
+ *
+ *	*version is the number to be assigned if a new format has to be stored.
+ *	previousVersion is the current format of the relation (zero for a new relation).
+ *	If the new layout is equal to the current one, no new format is stored
+ *	and *version is set to previousVersion.
  *
  **************************************/
 	TemporaryField* tfb;
@@ -5775,9 +5781,13 @@ static Format* make_format(thread_db* tdbb, jrd_rel* relation, USHORT* version, 
 
 	format->fmt_length = offset;
 
+	// Compare with the current format of the relation. Since format numbers are never
+	// reused (see scanFormatHistory), the current format is not necessarily the one
+	// numbered (fmt_version - 1): numbers left by failed DDL transactions are skipped.
+
 	Format* old_format;
-	if (format->fmt_version &&
-		(old_format = MET_format(tdbb, relation, (format->fmt_version - 1))) &&
+	if (format->fmt_version && previousVersion &&
+		(old_format = MET_format(tdbb, relation, previousVersion)) &&
 		(formatsAreEqual(old_format, format)))
 	{
 		delete format;
@@ -5852,7 +5862,8 @@ static Format* make_format(thread_db* tdbb, jrd_rel* relation, USHORT* version, 
 	}
 	END_STORE
 
-	// Prepare for cleanup (shit happens sometimes)
+	// Let phase 0 of make_version() know that a new format was stored by this transaction
+	// (it resets the cached current format of the relation if the commit fails)
 	if (transaction && work)
 	{
 		auto arg = DFW_post_work_arg(transaction, work, nullptr, format->fmt_version);
@@ -5861,6 +5872,103 @@ static Format* make_format(thread_db* tdbb, jrd_rel* relation, USHORT* version, 
 	}
 
 	return format;
+}
+
+
+namespace
+{
+	// What has ever been stored in RDB$FORMATS for a relation
+	struct FormatHistory
+	{
+		USHORT highestNumber = 0;	// highest format number
+		USHORT fieldIdLimit = 0;	// highest field id used by any format + 1
+	};
+}
+
+static FormatHistory scanFormatHistory(thread_db* tdbb, const jrd_rel* relation)
+{
+/**************************************
+ *
+ *	s c a n F o r m a t H i s t o r y
+ *
+ **************************************
+ *
+ * Functional description
+ *	Collect the highest format number and the highest field id used by
+ *	the formats stored for the relation, including formats left behind
+ *	by DDL transactions that failed to commit.
+ *
+ *	Why it is needed:
+ *	  - every record stores only the number of its format (rhd_format);
+ *	  - every attachment caches format descriptors in rel_formats and never
+ *	    invalidates them (formats are assumed to be immutable);
+ *	  - EVL_field() takes the default value of a field missing in an old
+ *	    record from the first newer format that knows this field id.
+ *	So a format number must identify exactly one record layout, and a field
+ *	id must identify exactly one column, for the whole lifetime of the relation.
+ *
+ *	The descriptor is stored in RDB$FORMATS by the system transaction, i.e. it
+ *	is visible to everybody at once and does not disappear when the DDL
+ *	transaction fails to commit. RDB$RELATIONS.RDB$FORMAT and RDB$FIELD_ID are
+ *	changed by the DDL transaction itself, but the system transaction of other
+ *	attachments reads them "dirty", and make_version() signals the rescan lock
+ *	before the remaining deferred work runs. So other attachments may cache the
+ *	new descriptor and store records with its number before the DDL transaction
+ *	fails. After the rollback RDB$FORMAT and RDB$FIELD_ID go back, while records
+ *	and cached descriptors using the new numbers survive. Hence new numbers must
+ *	be allocated above everything ever stored, not above the rolled back values.
+ *
+ **************************************/
+	SET_TDBB(tdbb);
+	Jrd::Attachment* const attachment = tdbb->getAttachment();	// used by the GPRE request below
+
+	FormatHistory history;
+	AutoRequest handle;
+
+	// The system transaction (default for this request) sees all formats,
+	// also the ones stored on behalf of a transaction that is still active.
+
+	FOR(REQUEST_HANDLE handle)
+		FMTS IN RDB$FORMATS WITH FMTS.RDB$RELATION_ID EQ relation->rel_id
+	{
+		if (FMTS.RDB$FORMAT > history.highestNumber)
+			history.highestNumber = FMTS.RDB$FORMAT;
+
+		// The descriptor BLOB starts with the number of field descriptors
+		// (= highest field id + 1), see make_format()
+
+		UCHAR countBytes[2] = {0, 0};
+		blb* const blob = blb::open(tdbb, attachment->getSysTransaction(), &FMTS.RDB$DESCRIPTOR);
+		const ULONG length = blob->BLB_get_data(tdbb, countBytes, sizeof(countBytes));
+
+		if (length == sizeof(countBytes))
+		{
+			const USHORT fieldCount = countBytes[0] | (countBytes[1] << 8);
+			if (fieldCount > history.fieldIdLimit)
+				history.fieldIdLimit = fieldCount;
+		}
+	}
+	END_FOR
+
+	// Formats cached by this attachment. Normally they are all present in the catalog,
+	// this is a cheap protection against a catalog entry removed by an older build.
+
+	if (const vec<Format*>* const formats = relation->rel_formats)
+	{
+		for (FB_SIZE_T number = 0; number < formats->count(); ++number)
+		{
+			if (const Format* const format = (*formats)[number])
+			{
+				if (number > history.highestNumber)
+					history.highestNumber = (USHORT) number;
+
+				if (format->fmt_count > history.fieldIdLimit)
+					history.fieldIdLimit = format->fmt_count;
+			}
+		}
+	}
+
+	return history;
 }
 
 
@@ -5906,34 +6014,73 @@ static bool make_version(thread_db* tdbb, SSHORT phase, DeferredWork* work, jrd_
 			if (!arg)
 				break;
 
-			// Remove just created format
+			// Existing relation (ALTER): the format just created (number arg->dfw_id) is
+			// intentionally kept, both in RDB$FORMATS and in the metadata cache. It was stored
+			// by the system transaction and other attachments may already use it: make_version()
+			// has signalled the rescan lock and RDB$RELATIONS.RDB$FORMAT is read "dirty" by the
+			// system transaction. Records stored with this number in the meantime must stay
+			// readable, and make_version() never assigns this number (and its field ids) to
+			// another layout, see scanFormatHistory(). Erasing the descriptor here is what
+			// produced "missing" formats (decoded as empty ones) and, after the number was
+			// reused, wrong record lengths.
+			//
+			// New relation (CREATE): nobody else can have records or requests of a relation
+			// that never existed in committed state, while its relation id may be reused by
+			// the next CREATE. Here the format is removed, as before (#9160).
+
+			// Format 0 describes an external file, it is not a version of the relation.
+
+			bool otherFormats = false;
 			handle.reset();
-			int rel_id = -1;
 
 			FOR(REQUEST_HANDLE handle)
 				REL IN RDB$RELATIONS
 					CROSS F IN RDB$FORMATS OVER RDB$RELATION_ID
 				WITH REL.RDB$RELATION_NAME EQ work->dfw_name.c_str()
-				 AND F.RDB$FORMAT EQ arg->dfw_id
+				 AND F.RDB$FORMAT NE arg->dfw_id
+				 AND F.RDB$FORMAT NE 0
 			{
-				ERASE F;
+				otherFormats = true;
 			}
 			END_FOR
+
+			if (!otherFormats)
+			{
+				handle.reset();
+
+				FOR(REQUEST_HANDLE handle)
+					REL IN RDB$RELATIONS
+						CROSS F IN RDB$FORMATS OVER RDB$RELATION_ID
+					WITH REL.RDB$RELATION_NAME EQ work->dfw_name.c_str()
+					 AND F.RDB$FORMAT EQ arg->dfw_id
+				{
+					ERASE F;
+				}
+				END_FOR
+			}
 
 			relation = MET_lookup_relation(tdbb, work->dfw_name);
 			if (relation)
 			{
-				vec<Format*>* vector = relation->rel_formats;
-				if (vector && (arg->dfw_id < vector->count()))
+				if (!otherFormats)
 				{
-					Format* format = (*vector)[arg->dfw_id];
-					if (format)
+					// The relation id may be reused by another relation with another
+					// format of the same number: forget the cached descriptor.
+					vec<Format*>* vector = relation->rel_formats;
+					if (vector && (arg->dfw_id < vector->count()))
 					{
-						(*vector)[arg->dfw_id] = NULL;
-						vector->trimNulls();
-						delete format;
+						Format* format = (*vector)[arg->dfw_id];
+						if (format)
+						{
+							(*vector)[arg->dfw_id] = NULL;
+							vector->trimNulls();
+							delete format;
+						}
 					}
 				}
+
+				// The relation is rescanned, so that this attachment re-reads the current
+				// format number instead of relying on the format of the failed DDL.
 
 				relation->rel_current_format = NULL;
 				relation->rel_flags &= ~REL_scanned;
@@ -5977,6 +6124,26 @@ static bool make_version(thread_db* tdbb, SSHORT phase, DeferredWork* work, jrd_
 			triggers[n] = NULL;
 		}
 
+		{
+			// Serialize format allocation between DDL transactions that change the same
+			// relation at the same time (see scanFormatHistory). The relation record is
+			// updated (without changing anything) by this transaction first. A concurrent
+			// DDL transaction waits here, or gets an update conflict, before it reads the
+			// format history and stores a format. Without it both transactions could store
+			// a format with the same number, and the failing one would leave a duplicate.
+
+			AutoRequest lockRequest;
+
+			FOR(REQUEST_HANDLE lockRequest TRANSACTION_HANDLE transaction)
+				REL IN RDB$RELATIONS WITH REL.RDB$RELATION_NAME EQ work->dfw_name.c_str()
+			{
+				MODIFY REL USING
+					REL.RDB$FORMAT.NULL = REL.RDB$FORMAT.NULL;
+				END_MODIFY
+			}
+			END_FOR
+		}
+
 		AutoCacheRequest request_fmt1(tdbb, irq_format1, IRQ_REQUESTS);
 
 		// User transaction may be safely used instead of system cause
@@ -6005,6 +6172,21 @@ static bool make_version(thread_db* tdbb, SSHORT phase, DeferredWork* work, jrd_
 			}
 
 			MODIFY REL USING
+				// Numbers used by formats ever stored for this relation, also by the ones
+				// left behind by failed DDL transactions (see scanFormatHistory).
+				const FormatHistory history = scanFormatHistory(tdbb, relation);
+
+				// New field ids are assigned below starting from RDB$FIELD_ID. Skip the ids
+				// used by formats of failed DDL transactions: the rollback restored the old
+				// RDB$FIELD_ID, but such formats (and maybe records) still use these ids.
+				// External tables use field positions as ids, so they are not affected.
+				// Note: RDB$FIELD_ID.NULL must not be referenced in this request. Without it
+				// GPRE treats NULL (a new relation) as zero and always stores a value here,
+				// which the loop below relies on.
+
+				if (!external_flag && REL.RDB$FIELD_ID < history.fieldIdLimit)
+					REL.RDB$FIELD_ID = history.fieldIdLimit;
+
 				blb* blob = blb::create(tdbb, transaction, &REL.RDB$RUNTIME);
 				AutoCacheRequest request_fmtx(tdbb, irq_format2, IRQ_REQUESTS);
 
@@ -6317,9 +6499,22 @@ static bool make_version(thread_db* tdbb, SSHORT phase, DeferredWork* work, jrd_
 				blob = setup_triggers(tdbb, relation, null_view, triggers, blob);
 
 				blob->BLB_close(tdbb);
-				USHORT version = REL.RDB$FORMAT.NULL ? 0 : REL.RDB$FORMAT;
-				version++;
-				relation->rel_current_format = make_format(tdbb, relation, &version, stack, work, transaction);
+
+				// The new format gets a number never used before for this relation,
+				// see scanFormatHistory(). make_format() keeps the current number
+				// if the record layout did not change.
+
+				const USHORT currentVersion = REL.RDB$FORMAT.NULL ? 0 : REL.RDB$FORMAT;
+				USHORT version = MAX(currentVersion, history.highestNumber) + 1;
+
+				if (REL.RDB$VIEW_BLR.NULL && version > MAX_TABLE_VERSIONS)
+					raiseTooManyVersionsError(obj_relation, work->dfw_name);
+
+				if (!REL.RDB$VIEW_BLR.NULL && version > MAX_VIEW_VERSIONS)
+					raiseTooManyVersionsError(obj_view, work->dfw_name);
+
+				relation->rel_current_format =
+					make_format(tdbb, relation, &version, stack, work, transaction, currentVersion);
 				REL.RDB$FORMAT.NULL = FALSE;
 				REL.RDB$FORMAT = version;
 
